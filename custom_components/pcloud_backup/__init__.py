@@ -130,6 +130,7 @@ async def _async_metadata_cache(hass: HomeAssistant, entry: ConfigEntry) -> Back
         store.async_delay_save(cache.as_data, METADATA_CACHE_SAVE_DELAY)
 
     cache = BackupMetadataCache(on_change=_save)
+    cache.store = store
     try:
         cache.load(await store.async_load())
     except Exception as err:  # noqa: BLE001 - a broken cache file must not block setup
@@ -147,6 +148,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if api:
             await api.async_close()
         if (cache := hass.data.get(DATA_METADATA_CACHE, {}).pop(entry.entry_id, None)) is not None:
+            if cache.store is not None:
+                # Write the current entries now: this also cancels a pending delayed save,
+                # so no writer from this (unloaded) cache can run later and overwrite or
+                # recreate the file (e.g. after a reload or after disabling the option).
+                await cache.store.async_save(cache.as_data())
             cache.clear()
         entry.runtime_data = None
 
@@ -156,3 +162,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove the persistent metadata cache of a deleted config entry."""
+    await _metadata_store(hass, entry).async_remove()

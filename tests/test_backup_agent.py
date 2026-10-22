@@ -697,3 +697,32 @@ async def test_metadata_downloads_run_in_parallel_but_bounded(
     assert len(backups) == count
     assert peak == METADATA_DOWNLOAD_CONCURRENCY
     assert mock_api.async_download_file.await_count == count
+
+
+async def test_failed_listing_cancels_remaining_downloads(
+    hass: HomeAssistant, agent: PCloudBackupAgent, mock_api, metadata_cache, monkeypatch
+) -> None:
+    """If one item fails unexpectedly, the other metadata downloads are cancelled."""
+    import asyncio
+
+    files = []
+    for i in range(3):
+        files.append({"name": f"B{i}.tar", "fileid": 3000 + i, "size": 1, "isfolder": False})
+        files.append({"name": f"B{i}.metadata.json", "fileid": 4000 + i, "hash": i + 1})
+    mock_api.async_list_folder.return_value = files
+    cancelled: list[str] = []
+
+    async def _fake(backup_files, metadata_files, key):
+        if key == "B0":
+            await asyncio.sleep(0)
+            raise RuntimeError("boom")
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled.append(key)
+            raise
+        return None
+
+    monkeypatch.setattr(agent, "_async_get_agent_backup", _fake)
+    assert await agent.async_list_backups() == []
+    assert sorted(cancelled) == ["B1", "B2"]

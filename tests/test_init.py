@@ -322,3 +322,74 @@ def test_metadata_cache_round_trip_and_change_hook() -> None:
     broken.load({"entries": [{"file_id": 3}, "x", {"file_id": 4, "hash": "h", "payload": []}]})
     broken.load(None)
     assert len(broken) == 0
+
+
+async def _setup_with_cache(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    from custom_components.pcloud_backup.const import CONF_CACHE_METADATA
+
+    entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        entry, options={**entry.options, CONF_CACHE_METADATA: True}
+    )
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+async def test_metadata_cache_reload_before_save_delay_keeps_entries(
+    hass: HomeAssistant, hass_storage, config_entry: MockConfigEntry, mock_pcloud
+) -> None:
+    """A reload within the save delay flushes the cache instead of losing or blanking it."""
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    await _setup_with_cache(hass, config_entry)
+    assert await hass.config_entries.async_reload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=1))
+    await hass.async_block_till_done()
+    key = f"{DOMAIN}.metadata_cache.{ENTRY_ID}"
+    assert len(hass_storage[key]["data"]["entries"]) == 1
+    assert len(hass.data[DATA_METADATA_CACHE][ENTRY_ID]) == 1
+    mock_pcloud["async_download_file"].assert_awaited_once()
+
+
+async def test_metadata_cache_disable_before_save_delay_leaves_no_file(
+    hass: HomeAssistant, hass_storage, config_entry: MockConfigEntry, mock_pcloud
+) -> None:
+    """Turning the option off right after a listing does not let an old writer recreate the file."""
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.pcloud_backup.const import CONF_CACHE_METADATA
+
+    await _setup_with_cache(hass, config_entry)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, CONF_CACHE_METADATA: False}
+    )
+    await hass.async_block_till_done()
+
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(minutes=1))
+    await hass.async_block_till_done()
+    assert f"{DOMAIN}.metadata_cache.{ENTRY_ID}" not in hass_storage
+
+
+async def test_metadata_cache_removed_with_entry(
+    hass: HomeAssistant, hass_storage, config_entry: MockConfigEntry, mock_pcloud
+) -> None:
+    """Deleting the config entry deletes its stored metadata cache."""
+    await _setup_with_cache(hass, config_entry)
+    assert await hass.config_entries.async_remove(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert f"{DOMAIN}.metadata_cache.{ENTRY_ID}" not in hass_storage
+
+
+def test_metadata_cache_json_round_trip_keeps_types() -> None:
+    """Integer file ids and large pCloud hashes survive a JSON round trip unchanged."""
+    import json
+
+    cache = BackupMetadataCache()
+    cache.set(108332615239, 2222222222222222222, {"backup": {"name": "x"}})
+    restored = BackupMetadataCache()
+    restored.load(json.loads(json.dumps(cache.as_data())))
+    assert restored.get(108332615239, 2222222222222222222) == {"backup": {"name": "x"}}

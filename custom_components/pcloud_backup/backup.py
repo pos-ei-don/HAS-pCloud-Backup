@@ -91,6 +91,8 @@ class BackupMetadataCache:
         """
         self._entries: dict[Any, tuple[Any, dict[str, Any]]] = {}
         self._on_change = on_change
+        # Persistent store owning this cache (None = memory only); set by entry setup.
+        self.store: Any = None
 
     def _changed(self) -> None:
         if self._on_change is not None:
@@ -373,7 +375,16 @@ class PCloudBackupAgent(BackupAgent):
                 )
 
         keys = list(backup_files)
-        results = await asyncio.gather(*(_get(key) for key in keys))
+        tasks = [asyncio.ensure_future(_get(key)) for key in keys]
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            # gather does not cancel the other downloads when one fails; do it here so
+            # no request keeps running (and filling the cache) after the listing failed.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         for metadata_key, agent_backup in zip(keys, results, strict=True):
             if not agent_backup:
