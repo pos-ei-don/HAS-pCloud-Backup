@@ -302,6 +302,20 @@ async def test_metadata_cache_store_removed_when_disabled(
     mock_pcloud["async_download_file"].assert_awaited_once()
 
 
+async def test_metadata_cache_remove_failure_does_not_block_setup(
+    hass: HomeAssistant, config_entry: MockConfigEntry, mock_pcloud, monkeypatch, caplog
+) -> None:
+    """A stored cache that cannot be removed is reported, but setup still succeeds."""
+    store = MagicMock()
+    store.async_remove = AsyncMock(side_effect=PermissionError("read-only"))
+    monkeypatch.setattr("custom_components.pcloud_backup._metadata_store", lambda *_: store)
+
+    assert await _setup(hass, config_entry)
+
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert "Could not remove stored pCloud metadata cache" in caplog.text
+
+
 def test_metadata_cache_round_trip_and_change_hook() -> None:
     """as_data/load restore the entries; set and a pruning prune report a change."""
     changes: list[int] = []

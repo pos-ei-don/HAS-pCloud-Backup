@@ -121,7 +121,11 @@ async def _async_metadata_cache(hass: HomeAssistant, entry: ConfigEntry) -> Back
     """
     store = _metadata_store(hass, entry)
     if not entry.options.get(CONF_CACHE_METADATA, DEFAULT_CACHE_METADATA):
-        await store.async_remove()
+        try:
+            await store.async_remove()
+        except OSError as err:
+            # Caching is off anyway; a leftover file must not block setup.
+            _LOGGER.warning("Could not remove stored pCloud metadata cache: %s", err)
         return BackupMetadataCache()
 
     cache: BackupMetadataCache
