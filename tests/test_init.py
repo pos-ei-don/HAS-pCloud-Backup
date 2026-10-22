@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from homeassistant.components.backup import DATA_MANAGER
@@ -248,3 +249,76 @@ async def test_agent_survives_options_reload(
     assert await hass.config_entries.async_unload(config_entry.entry_id)
     await hass.async_block_till_done()
     assert AGENT_ID not in _backup_agent_ids(hass)
+
+
+# --- Persistent metadata cache (option) -------------------------------------
+
+
+async def test_metadata_cache_persisted_when_enabled(
+    hass: HomeAssistant, hass_storage, config_entry: MockConfigEntry, mock_pcloud
+) -> None:
+    """With the option on, parsed metadata is stored and reused after a reload."""
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    from custom_components.pcloud_backup.const import (
+        CONF_CACHE_METADATA,
+        METADATA_CACHE_SAVE_DELAY,
+    )
+
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={**config_entry.options, CONF_CACHE_METADATA: True}
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    mock_pcloud["async_download_file"].assert_awaited_once()
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=METADATA_CACHE_SAVE_DELAY + 1)
+    )
+    await hass.async_block_till_done()
+    key = f"{DOMAIN}.metadata_cache.{ENTRY_ID}"
+    assert len(hass_storage[key]["data"]["entries"]) == 1
+
+    # Simulate a Home Assistant restart: the in-memory cache is gone, the stored one is loaded.
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(hass.data[DATA_METADATA_CACHE][ENTRY_ID]) == 1
+    mock_pcloud["async_download_file"].assert_awaited_once()
+
+
+async def test_metadata_cache_store_removed_when_disabled(
+    hass: HomeAssistant, hass_storage, config_entry: MockConfigEntry, mock_pcloud
+) -> None:
+    """With the option off (default), a stored cache is removed and metadata is fetched fresh."""
+    key = f"{DOMAIN}.metadata_cache.{ENTRY_ID}"
+    hass_storage[key] = {"version": 1, "minor_version": 1, "key": key, "data": {"entries": []}}
+
+    assert await _setup(hass, config_entry)
+
+    assert key not in hass_storage
+    mock_pcloud["async_download_file"].assert_awaited_once()
+
+
+def test_metadata_cache_round_trip_and_change_hook() -> None:
+    """as_data/load restore the entries; set and a pruning prune report a change."""
+    changes: list[int] = []
+    cache = BackupMetadataCache(on_change=lambda: changes.append(1))
+    cache.set(1, "h1", {"a": 1})
+    cache.prune([1])  # nothing stale -> no change
+    assert len(changes) == 1
+    cache.set(2, "h2", {"b": 2})
+    cache.prune([2])  # drops 1
+    assert len(changes) == 3
+
+    restored = BackupMetadataCache()
+    restored.load(cache.as_data())
+    assert restored.get(2, "h2") == {"b": 2}
+    assert restored.get(1, "h1") is None
+
+    broken = BackupMetadataCache()
+    broken.load({"entries": [{"file_id": 3}, "x", {"file_id": 4, "hash": "h", "payload": []}]})
+    broken.load(None)
+    assert len(broken) == 0

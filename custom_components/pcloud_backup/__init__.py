@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.storage import Store
 
 from .api import PCloudAPI, PCloudAuthError
 from .auth import create_auth
 from .backup import BackupMetadataCache
 from .const import (
+    CONF_CACHE_METADATA,
     CONF_REGION,
     DATA_BACKUP_AGENT_LISTENERS,
     DATA_METADATA_CACHE,
+    DEFAULT_CACHE_METADATA,
     DOMAIN,
+    METADATA_CACHE_SAVE_DELAY,
+    METADATA_CACHE_STORAGE_VERSION,
     PLATFORMS,
 )
 
@@ -84,7 +90,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.runtime_data = api
     # Backup agents are re-created whenever HA reloads agents; keep the parsed
     # metadata cache per entry so it survives that and is dropped on unload.
-    hass.data.setdefault(DATA_METADATA_CACHE, {})[entry.entry_id] = BackupMetadataCache()
+    hass.data.setdefault(DATA_METADATA_CACHE, {})[entry.entry_id] = await _async_metadata_cache(
+        hass, entry
+    )
 
     # Notify backup manager listeners on every state change. Notifying only
     # during setup is too early: the entry is still SETUP_IN_PROGRESS, so
@@ -99,6 +107,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+def _metadata_store(hass: HomeAssistant, entry: ConfigEntry) -> Store[dict[str, Any]]:
+    return Store(hass, METADATA_CACHE_STORAGE_VERSION, f"{DOMAIN}.metadata_cache.{entry.entry_id}")
+
+
+async def _async_metadata_cache(hass: HomeAssistant, entry: ConfigEntry) -> BackupMetadataCache:
+    """Create the metadata cache; optionally backed by persistent storage.
+
+    With the option off (default) the cache lives in memory only and every Home Assistant
+    start downloads the metadata files again; a previously stored copy is removed.
+    """
+    store = _metadata_store(hass, entry)
+    if not entry.options.get(CONF_CACHE_METADATA, DEFAULT_CACHE_METADATA):
+        await store.async_remove()
+        return BackupMetadataCache()
+
+    cache: BackupMetadataCache
+
+    def _save() -> None:
+        store.async_delay_save(cache.as_data, METADATA_CACHE_SAVE_DELAY)
+
+    cache = BackupMetadataCache(on_change=_save)
+    try:
+        cache.load(await store.async_load())
+    except Exception as err:  # noqa: BLE001 - a broken cache file must not block setup
+        _LOGGER.warning("Ignoring unreadable pCloud metadata cache: %s", err)
+    _LOGGER.debug("Loaded %d cached pCloud metadata entries", len(cache))
+    return cache
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
